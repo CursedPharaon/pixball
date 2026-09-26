@@ -1,8 +1,8 @@
+
 import asyncio
 import json
 import math
 import os
-import time
 import uuid
 
 from aiohttp import web, WSMsgType
@@ -25,6 +25,16 @@ KICK_POWER = 9.0
 RED = "red"
 BLUE = "blue"
 
+# Разрешённые Origin для WebSocket.
+# Впиши сюда URL клиента на Render. Пустое множество = разрешить всем.
+ALLOWED_ORIGINS = {
+    "https://pixball.onrender.com",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+}
+
 
 class Player:
     def __init__(self, pid, name, team):
@@ -35,7 +45,8 @@ class Player:
         self.y = H / 2
         self.vx = 0.0
         self.vy = 0.0
-        self.input = {"up": False, "down": False, "left": False, "right": False, "kick": False}
+        self.input = {"up": False, "down": False, "left": False,
+                      "right": False, "kick": False}
         self.kick_cd = 0
 
     def to_dict(self):
@@ -48,10 +59,9 @@ class Game:
         self.players = {}
         self.ball = {"x": W / 2, "y": H / 2, "vx": 0.0, "vy": 0.0}
         self.score = {RED: 0, BLUE: 0}
-        self.reset_timer = 0
+        self.reset_timer = 0.0
 
     def add_player(self, name):
-        # балансируем команды
         reds = sum(1 for p in self.players.values() if p.team == RED)
         blues = sum(1 for p in self.players.values() if p.team == BLUE)
         team = RED if reds <= blues else BLUE
@@ -72,10 +82,14 @@ class Game:
         # --- игроки ---
         for p in self.players.values():
             ax = ay = 0.0
-            if p.input["left"]: ax -= PLAYER_ACC
-            if p.input["right"]: ax += PLAYER_ACC
-            if p.input["up"]: ay -= PLAYER_ACC
-            if p.input["down"]: ay += PLAYER_ACC
+            if p.input["left"]:
+                ax -= PLAYER_ACC
+            if p.input["right"]:
+                ax += PLAYER_ACC
+            if p.input["up"]:
+                ay -= PLAYER_ACC
+            if p.input["down"]:
+                ay += PLAYER_ACC
             if ax and ay:
                 ax *= 0.7071
                 ay *= 0.7071
@@ -83,18 +97,15 @@ class Game:
             p.vy = (p.vy + ay) * PLAYER_DAMP
             p.x += p.vx
             p.y += p.vy
-            # границы (кроме зон ворот)
+
+            # границы поля (в зоне ворот по X пускаем дальше — но не за поле)
             p.x = max(PLAYER_R, min(W - PLAYER_R, p.x))
-            in_goal_y = GOAL_TOP < p.y < GOAL_BOT
-            if not in_goal_y:
-                p.y = max(PLAYER_R, min(H - PLAYER_R, p.y))
-            else:
-                p.y = max(PLAYER_R, min(H - PLAYER_R, p.y))
+            p.y = max(PLAYER_R, min(H - PLAYER_R, p.y))
 
             if p.kick_cd > 0:
                 p.kick_cd -= 1
                 continue
-            # удар
+
             if p.input["kick"]:
                 dx = self.ball["x"] - p.x
                 dy = self.ball["y"] - p.y
@@ -115,11 +126,16 @@ class Game:
                 if 0 < d < min_d:
                     overlap = (min_d - d) / 2
                     nx, ny = dx / d, dy / d
-                    a.x -= nx * overlap; a.y -= ny * overlap
-                    b.x += nx * overlap; b.y += ny * overlap
-                    # обмен импульсом (упрощённо)
-                    a.vx, b.vx = b.vx * 0.5, a.vx * 0.5
-                    a.vy, b.vy = b.vy * 0.5, a.vy * 0.5
+                    a.x -= nx * overlap
+                    a.y -= ny * overlap
+                    b.x += nx * overlap
+                    b.y += ny * overlap
+                    # мягкий обмен импульсом
+                    avx, avy = a.vx, a.vy
+                    a.vx = b.vx * 0.5
+                    a.vy = b.vy * 0.5
+                    b.vx = avx * 0.5
+                    b.vy = avy * 0.5
 
         # --- мяч ---
         b = self.ball
@@ -128,7 +144,7 @@ class Game:
         b["x"] += b["vx"]
         b["y"] += b["vy"]
 
-        # столкновение мяч-игрок
+        # мяч-игрок
         for p in self.players.values():
             dx = b["x"] - p.x
             dy = b["y"] - p.y
@@ -138,37 +154,45 @@ class Game:
                 nx, ny = dx / d, dy / d
                 b["x"] = p.x + nx * min_d
                 b["y"] = p.y + ny * min_d
-                # толчок
                 b["vx"] = nx * 2.0 + p.vx * 0.6
                 b["vy"] = ny * 2.0 + p.vy * 0.6
 
         # стены и голы
         if b["y"] - BALL_R < 0 and not (GOAL_TOP < b["x"] < GOAL_BOT):
-            b["y"] = BALL_R; b["vy"] *= -0.8
+            b["y"] = BALL_R
+            b["vy"] *= -0.8
         if b["y"] + BALL_R > H and not (GOAL_TOP < b["x"] < GOAL_BOT):
-            b["y"] = H - BALL_R; b["vy"] *= -0.8
+            b["y"] = H - BALL_R
+            b["vy"] *= -0.8
+
         if b["x"] - BALL_R < 0:
             if GOAL_TOP < b["y"] < GOAL_BOT:
-                self.score[BLUE] += 1; self._start_reset()
-            else:
-                b["x"] = BALL_R; b["vx"] *= -0.8
+                self.score[BLUE] += 1
+                self._start_reset()
+                return
+            b["x"] = BALL_R
+            b["vx"] *= -0.8
+
         if b["x"] + BALL_R > W:
             if GOAL_TOP < b["y"] < GOAL_BOT:
-                self.score[RED] += 1; self._start_reset()
-            else:
-                b["x"] = W - BALL_R; b["vx"] *= -0.8
+                self.score[RED] += 1
+                self._start_reset()
+                return
+            b["x"] = W - BALL_R
+            b["vx"] *= -0.8
 
     def _start_reset(self):
         self.reset_timer = 1.5
         self.ball = {"x": W / 2, "y": H / 2, "vx": 0.0, "vy": 0.0}
         for p in self.players.values():
-            p.vx = p.vy = 0
+            p.vx = 0.0
+            p.vy = 0.0
 
     def _reset_positions(self):
         for p in self.players.values():
             p.x = 150 if p.team == RED else W - 150
             p.y = H / 2
-            p.vx = p.vy = 0
+            p.vx = p.vy = 0.0
 
     def snapshot(self):
         return {
@@ -183,56 +207,69 @@ game = Game()
 clients = {}  # ws -> player_id
 
 
+async def health(request):
+    return web.Response(text="ok")
+
+
 async def ws_handler(request):
-    ws = web.WebSocketResponse()
+    origin = request.headers.get("Origin", "")
+    if ALLOWED_ORIGINS and origin and origin not in ALLOWED_ORIGINS:
+        return web.Response(status=403, text="forbidden origin")
+
+    ws = web.WebSocketResponse(heartbeat=30)
     await ws.prepare(request)
 
     player = None
-    async for msg in ws:
-        if msg.type != WSMsgType.TEXT:
-            continue
-        try:
-            data = json.loads(msg.data)
-        except Exception:
-            continue
+    try:
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                continue
+            try:
+                data = json.loads(msg.data)
+            except Exception:
+                continue
 
-        t = data.get("type")
-        if t == "join" and player is None:
-            player = game.add_player(data.get("name", ""))
-            clients[ws] = player.id
-            await ws.send_json({"type": "welcome", "id": player.id,
-                                "field": {"w": W, "h": H, "goalTop": GOAL_TOP,
-                                          "goalBot": GOAL_BOT, "ballR": BALL_R,
-                                          "playerR": PLAYER_R}})
-        elif t == "input" and player is not None:
-            inp = data.get("input", {})
-            for k in ("up", "down", "left", "right", "kick"):
-                player.input[k] = bool(inp.get(k, False))
-
-    if player is not None:
-        game.remove_player(player.id)
+            t = data.get("type")
+            if t == "join" and player is None:
+                player = game.add_player(data.get("name", ""))
+                clients[ws] = player.id
+                await ws.send_json({
+                    "type": "welcome",
+                    "id": player.id,
+                    "field": {
+                        "w": W, "h": H,
+                        "goalTop": GOAL_TOP, "goalBot": GOAL_BOT,
+                        "ballR": BALL_R, "playerR": PLAYER_R,
+                    },
+                })
+            elif t == "input" and player is not None:
+                inp = data.get("input", {})
+                for k in ("up", "down", "left", "right", "kick"):
+                    player.input[k] = bool(inp.get(k, False))
+    finally:
+        if player is not None:
+            game.remove_player(player.id)
         clients.pop(ws, None)
+
     return ws
 
 
 async def ticker(app):
     while True:
-        game.step()
-        snap = game.snapshot()
-        dead = []
-        for ws in list(clients.keys()):
-            try:
-                await ws.send_json(snap)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            clients.pop(ws, None)
+        try:
+            game.step()
+            snap = game.snapshot()
+            dead = []
+            for ws in list(clients.keys()):
+                try:
+                    await ws.send_json(snap)
+                except Exception:
+                    dead.append(ws)
+            for ws in dead:
+                clients.pop(ws, None)
+        except Exception as e:
+            print("ticker error:", e)
         await asyncio.sleep(TICK)
-
-
-async def index(request):
-    with open(os.path.join(os.path.dirname(__file__), "index.html"), encoding="utf-8") as f:
-        return web.Response(text=f.read(), content_type="text/html")
 
 
 async def on_startup(app):
@@ -241,11 +278,15 @@ async def on_startup(app):
 
 async def on_cleanup(app):
     app["ticker"].cancel()
+    try:
+        await app["ticker"]
+    except asyncio.CancelledError:
+        pass
 
 
 def main():
     app = web.Application()
-    app.router.add_get("/", index)
+    app.router.add_get("/", health)
     app.router.add_get("/ws", ws_handler)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
