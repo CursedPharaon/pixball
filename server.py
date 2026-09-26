@@ -28,11 +28,9 @@ BLUE = "blue"
 # Разрешённые Origin для WebSocket.
 # Впиши сюда URL клиента на Render. Пустое множество = разрешить всем.
 ALLOWED_ORIGINS = {
-    "https://pixball.onrender.com",
+    "https://pixball-client.onrender.com",
     "http://localhost:8080",
     "http://127.0.0.1:8080",
-    "http://localhost:5500",
-    "http://127.0.0.1:5500",
 }
 
 
